@@ -205,7 +205,7 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             next_state_actions = target_actor(data.next_observations)
-            qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+            qf1_next_target = qf1(data.next_observations, next_state_actions)
             next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
