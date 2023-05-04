@@ -156,8 +156,8 @@ if __name__ == "__main__":
 
     actor = Actor(envs).to(device)
     qf1 = QNetwork(envs).to(device)
-    m_qf1 = QNetwork(envs).to(device)
 
+    m_qf1 = QNetwork(envs).to(device)
     with torch.no_grad():
         for w in m_qf1.parameters():
             w.fill_(0)
@@ -218,7 +218,7 @@ if __name__ == "__main__":
         # ALGO LOGIC: training.
 
         ##
-        ## Need per=sample grads
+        ## RAN: Need per=sample grads
         ##
 
         def compute_delta(params, observations, actions, rewards, next_observations, dones):
@@ -227,7 +227,8 @@ if __name__ == "__main__":
             rewards = rewards.unsqueeze(0)
             next_observations = next_observations.unsqueeze(0)
             dones = dones.unsqueeze(0)
-            next_state_actions = target_actor(next_observations)
+            with torch.no_grad():
+                next_state_actions = target_actor(next_observations)
             qf1_next_target = functional_call(qf1, (params,), (next_observations, next_state_actions))
             next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
             qf1_a_values = functional_call(qf1, (params,), (observations, actions)).view(-1)
@@ -244,8 +245,9 @@ if __name__ == "__main__":
 
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
-            next_state_actions = target_actor(data.next_observations)
-            qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+            with torch.no_grad():
+                next_state_actions = target_actor(data.next_observations)
+            qf1_next_target = qf1(data.next_observations, next_state_actions)
             next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
@@ -256,12 +258,12 @@ if __name__ == "__main__":
             M_optimizer.zero_grad()
             qf1_loss.backward()
 
-
             ##
             ## RAN Additions
             ##
+
             lambda_val = 0.999
-            beta = 1 - lambda_val
+            beta = 0.0001
 
             for m, p in zip(m_qf1.parameters(), qf1.parameters()):
                 m.data = lambda_val*m.data + beta*p.grad
@@ -272,6 +274,17 @@ if __name__ == "__main__":
             params = {k: v.detach() for k, v in qf1.named_parameters()}
             gs = compute_sample_nabla_delta(params, data.observations, data.actions, data.rewards, data.next_observations, data.dones)
 
+            m_nabla_delta = torch.zeros(args.batch_size).to(device)
+            for m, p in zip(m_qf1.named_parameters(), qf1.named_parameters()):
+                name = p[0]
+                m = m[1]
+                p = p[1]
+                nabla_deltas = gs[name]
+
+                m_ = m.unsqueeze(0)
+
+                m_nabla_delta += torch.mul(m_, nabla_deltas).reshape(args.batch_size, -1).sum(1)/args.batch_size
+
             for m, p in zip(m_qf1.named_parameters(), qf1.named_parameters()):
                 name = p[0]
                 m = m[1]
@@ -279,16 +292,16 @@ if __name__ == "__main__":
                 nabla_deltas = gs[name]
 
                 if len(p.shape) == 2:
-                    m_nabla_deltas = torch.mul(m, nabla_deltas).reshape(args.batch_size, -1).sum(1).reshape(-1, 1, 1)
+                    m_nabla_delta_ = m_nabla_delta.reshape(-1, 1, 1)
                 elif len(p.shape) == 1:
-                    m_nabla_deltas = torch.mul(m, nabla_deltas).reshape(args.batch_size, -1).sum(1).reshape(-1, 1)
+                    m_nabla_delta_ = m_nabla_delta.reshape(-1, 1)
 
-                m_nabla_deltas_nabla_deltas = torch.mul(m_nabla_deltas, nabla_deltas).mean(0)
+                m_nabla_delta_nabla_delta = torch.mul(m_nabla_delta_, nabla_deltas).mean(0) # Average over the samples of (m^T \nabla \delta) \nabla \delta
 
-                # m.grad = m_nabla_deltas_nabla_deltas # let M be updated with its own optimizer
-                m.data = m - beta*m_nabla_deltas_nabla_deltas
+                # m.grad = m_nabla_delta_nabla_delta # let M be updated with its own optimizer
+                m.data = m - beta*m_nabla_delta_nabla_delta
 
-            M_optimizer.step()
+            M_optimizer.step() # Does nothing, unless m.grad is set
 
             for m, p in zip(m_qf1.parameters(), qf1.parameters()):
                 p.grad = m.data # let q be updated with its own optimizer
