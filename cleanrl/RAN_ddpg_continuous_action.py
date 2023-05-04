@@ -19,7 +19,16 @@ from torch.utils.tensorboard import SummaryWriter
 
 from torch.func import functional_call, vmap, grad
 
-
+def l1_params(model):
+    s = 0
+    total_dims = 0
+    for p in model.parameters():
+        dims = p.size()
+        dims = np.array(dims).prod()
+        total_dims += dims
+        n = p.cpu().data.numpy().reshape(-1)
+        s += np.sum(np.abs(n))
+    return s/total_dims
 
 def parse_args():
     # fmt: off
@@ -156,21 +165,26 @@ if __name__ == "__main__":
 
     actor = Actor(envs).to(device)
     qf1 = QNetwork(envs).to(device)
-
-    m_qf1 = QNetwork(envs).to(device)
-    with torch.no_grad():
-        for w in m_qf1.parameters():
-            w.fill_(0)
-
     qf1_target = QNetwork(envs).to(device)
     target_actor = Actor(envs).to(device)
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()), lr=args.learning_rate)
-    # q_optimizer = optim.SGD(list(qf1.parameters()), lr=0.0001)
-    M_optimizer = optim.Adam(list(m_qf1.parameters()), lr=args.learning_rate)
-    # M_optimizer = optim.SGD(list(m_qf1.parameters()), lr=0.001)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+
+    ##
+    ## RAN: m_qf1 is not used for inference, it is used to hold the momentum variables
+    ##
+    m_qf1 = QNetwork(envs).to(device)
+    with torch.no_grad():
+        for w in m_qf1.parameters():
+            w.fill_(0)
+
+    M_optimizer = optim.RMSprop(list(m_qf1.parameters()), lr=0.5*args.learning_rate)
+    ##
+    ## END: initializing momentum to 0
+    ##
+
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -181,6 +195,32 @@ if __name__ == "__main__":
         handle_timeout_termination=True,
     )
     start_time = time.time()
+
+    ##
+    ## RAN: Need per=sample grads
+    ##
+
+    def compute_delta(params, observations, actions, rewards, next_observations, dones):
+        observations = observations.unsqueeze(0)
+        actions = actions.unsqueeze(0)
+        rewards = rewards.unsqueeze(0)
+        next_observations = next_observations.unsqueeze(0)
+        dones = dones.unsqueeze(0)
+        with torch.no_grad():
+            next_state_actions = target_actor(next_observations)
+        qf1_next_target = functional_call(qf1, (params,), (next_observations, next_state_actions))
+        next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
+        qf1_a_values = functional_call(qf1, (params,), (observations, actions)).view(-1)
+        delta_ = next_q_value - qf1_a_values
+        delta = torch.sum(delta_)
+        return delta
+
+    compute_nabla_delta = grad(compute_delta)
+    compute_sample_nabla_delta = vmap(compute_nabla_delta, in_dims=(None, 0, 0, 0, 0, 0))
+
+    ##
+    ## END
+    ##
 
     # TRY NOT TO MODIFY: start the game
     obs = envs.reset()
@@ -217,32 +257,6 @@ if __name__ == "__main__":
 
         # ALGO LOGIC: training.
 
-        ##
-        ## RAN: Need per=sample grads
-        ##
-
-        def compute_delta(params, observations, actions, rewards, next_observations, dones):
-            observations = observations.unsqueeze(0)
-            actions = actions.unsqueeze(0)
-            rewards = rewards.unsqueeze(0)
-            next_observations = next_observations.unsqueeze(0)
-            dones = dones.unsqueeze(0)
-            with torch.no_grad():
-                next_state_actions = target_actor(next_observations)
-            qf1_next_target = functional_call(qf1, (params,), (next_observations, next_state_actions))
-            next_q_value = rewards.flatten() + (1 - dones.flatten()) * args.gamma * (qf1_next_target).view(-1)
-            qf1_a_values = functional_call(qf1, (params,), (observations, actions)).view(-1)
-            delta_ = next_q_value - qf1_a_values
-            delta = torch.sum(delta_)
-            return delta
-
-        compute_nabla_delta = grad(compute_delta)
-        compute_sample_nabla_delta = vmap(compute_nabla_delta, in_dims=(None, 0, 0, 0, 0, 0))
-
-        ##
-        ## END
-        ##
-
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
@@ -255,18 +269,21 @@ if __name__ == "__main__":
 
             # optimize the model
             q_optimizer.zero_grad()
-            M_optimizer.zero_grad()
             qf1_loss.backward()
 
             ##
             ## RAN Additions
             ##
 
+            M_optimizer.zero_grad()
+
             lambda_val = 0.999
-            beta = 0.0001
+            beta = 0.001
+            clip_val = 100
 
             for m, p in zip(m_qf1.parameters(), qf1.parameters()):
                 m.data = lambda_val*m.data + beta*p.grad
+                # m.data = lambda_val*m.data + beta*torch.clip(p.grad, min=-clip_val, max=clip_val)
 
             q_optimizer.zero_grad()
             M_optimizer.zero_grad()
@@ -280,16 +297,18 @@ if __name__ == "__main__":
                 m = m[1]
                 p = p[1]
                 nabla_deltas = gs[name]
+                # nabla_deltas = torch.clip(gs[name], min=-clip_val, max=clip_val)
 
                 m_ = m.unsqueeze(0)
 
-                m_nabla_delta += torch.mul(m_, nabla_deltas).reshape(args.batch_size, -1).sum(1)/args.batch_size
+                m_nabla_delta += torch.mul(m_, nabla_deltas).reshape(args.batch_size, -1).sum(1)
 
             for m, p in zip(m_qf1.named_parameters(), qf1.named_parameters()):
                 name = p[0]
                 m = m[1]
                 p = p[1]
                 nabla_deltas = gs[name]
+                # nabla_deltas = torch.clip(gs[name], min=-clip_val, max=clip_val)
 
                 if len(p.shape) == 2:
                     m_nabla_delta_ = m_nabla_delta.reshape(-1, 1, 1)
@@ -298,13 +317,15 @@ if __name__ == "__main__":
 
                 m_nabla_delta_nabla_delta = torch.mul(m_nabla_delta_, nabla_deltas).mean(0) # Average over the samples of (m^T \nabla \delta) \nabla \delta
 
-                # m.grad = m_nabla_delta_nabla_delta # let M be updated with its own optimizer
-                m.data = m - beta*m_nabla_delta_nabla_delta
+                # m.grad = torch.clip(m_nabla_delta_nabla_delta, min=-clip_val, max=clip_val) # let M be updated with its own optimizer
+                m.grad = m_nabla_delta_nabla_delta # let M be updated with its own optimizer
+                # m.data = m - beta*m_nabla_delta_nabla_delta
 
             M_optimizer.step() # Does nothing, unless m.grad is set
 
             for m, p in zip(m_qf1.parameters(), qf1.parameters()):
                 p.grad = m.data # let q be updated with its own optimizer
+                # p.grad = torch.clip(m.data, min=-clip_val, max=clip_val) # let q be updated with its own optimizer
 
             ##
             ## END
@@ -328,6 +349,8 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+                writer.add_scalar("weights/l1_qf1", l1_params(qf1), global_step)
+                writer.add_scalar("weights/l1_m", l1_params(m_qf1), global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
